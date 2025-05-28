@@ -13,6 +13,12 @@ import transformers
 from peft import LoraConfig, get_peft_model
 from torch.utils.tensorboard import SummaryWriter
 
+# Get the absolute path of the directory containing the current script
+current_script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(current_script_dir, '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root) # Insert at the beginning for higher priority
+
 from model.LISA import LISAForCausalLM
 from model.llava import conversation as conversation_lib
 from utils.dataset import HybridDataset, ValDataset, collate_fn

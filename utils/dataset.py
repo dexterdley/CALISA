@@ -25,6 +25,7 @@ from .utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                     DEFAULT_IMAGE_TOKEN)
 from .vqa_dataset import VQADataset
 
+import pdb
 
 def collate_fn(
     batch, tokenizer=None, conv_type="llava_v1", use_mm_start_end=True, local_rank=-1
@@ -292,6 +293,7 @@ class ValDataset(torch.utils.data.Dataset):
             )
             self.images = images
             self.data_type = "reason_seg"
+            
         elif len(splits) == 3:
             ds, splitBy, split = splits
             refer_api = REFER(self.base_image_dir, ds, splitBy)
