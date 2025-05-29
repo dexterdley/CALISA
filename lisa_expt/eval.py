@@ -46,10 +46,11 @@ def parse_args(args):
         "--vision-tower", default="openai/clip-vit-large-patch14", type=str
     )
     
-    parser.add_argument("--val_dataset", default="ReasonSeg|val", type=str)
+    parser.add_argument("--val_dataset", default="ReasonSeg|test", type=str)
     parser.add_argument("--dataset_dir", default="./dataset", type=str)
     parser.add_argument("--val_batch_size", default=1, type=int)
     parser.add_argument("--workers", default=4, type=int)
+    parser.add_argument("--noise", default=0.5, type=float)
 
     parser.add_argument("--local-rank", default=0, type=int, help="node rank")
     parser.add_argument("--load_in_8bit", action="store_true", default=False)
@@ -63,6 +64,33 @@ def parse_args(args):
     )
     return parser.parse_args(args)
 
+def add_diffusion_noise(image_tensor, noise_step):
+    num_steps = 1000  # Number of diffusion steps
+
+    # decide beta in each step
+    betas = torch.linspace(-6, 6, num_steps)
+    betas = torch.sigmoid(betas) * (0.5e-2 - 1e-5) + 1e-5
+
+    # decide alphas in each step
+    alphas = 1 - betas
+    alphas_prod = torch.cumprod(alphas, dim=0)
+    alphas_bar_sqrt = torch.sqrt(alphas_prod)
+    one_minus_alphas_bar_sqrt = torch.sqrt(1 - alphas_prod)
+
+    def q_x(x_0, t):
+        noise = torch.randn_like(x_0)
+        alphas_t = alphas_bar_sqrt[t]
+        alphas_1_m_t = one_minus_alphas_bar_sqrt[t]
+        return (alphas_t * x_0 + alphas_1_m_t * noise)
+
+    noisy_image = image_tensor.clone()
+    image_tensor_cd = q_x(noisy_image, noise_step)
+    return image_tensor_cd
+
+def gaussian_noise(x, bound=0.01):
+    lam = torch.distributions.Beta(1,1).sample((x.shape[0], 1, 1, 1)).to(x.device)
+    noise_img = torch.randn_like(x) * torch.rand(1).to(x.device) * bound
+    return lam * x + (1 - lam) * noise_img
 
 def preprocess(
     x,
@@ -253,7 +281,80 @@ def main(args):
 
     model.eval()
 
-    giou, ciou = validate(val_loader, model, 0, None, args)
+    intersection_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
+    union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
+    acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
+
+    for i in tqdm.tqdm(range(val_dataset.__len__())):
+        image_path, images, images_clip, conversation, masks, label, resize, questions, sampled_classes, inference = val_dataset.__getitem__(i)
+
+        if args.use_mm_start_end:
+            # replace <image> token
+            replace_token = (
+                DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
+            )
+            conversation = conversation[0].replace(
+                DEFAULT_IMAGE_TOKEN, replace_token
+            )
+        input_ids = tokenizer_image_token(conversation, tokenizer, return_tensors="pt")
+        input_ids = input_ids.unsqueeze(0).cuda()
+        
+        output_ids, pred_masks = model.evaluate(
+                images_clip.bfloat16().unsqueeze(0).cuda(),
+                images.bfloat16().unsqueeze(0).cuda(),
+                input_ids,
+                resize_list=[resize],
+                original_size_list=[tuple(masks.squeeze(0).shape)],
+                max_new_tokens=512,
+                tokenizer=tokenizer,
+        )
+
+        cd_output_ids, cd_pred_masks = model.evaluate(
+                images_clip.bfloat16().unsqueeze(0).cuda(),
+                gaussian_noise(images.unsqueeze(0), args.noise).bfloat16().cuda(),
+                input_ids,
+                resize_list=[resize],
+                original_size_list=[tuple(masks.squeeze(0).shape)],
+                max_new_tokens=512,
+                tokenizer=tokenizer,
+        )
+        P_probs, Q_probs = F.sigmoid(pred_masks[0]), F.sigmoid(cd_pred_masks[0])
+
+        IW = (P_probs / Q_probs.clamp(min=1e-6)).clamp(max=1e4)
+        weighted_probs = torch.sqrt(IW * P_probs)
+
+        masks_list = [masks.squeeze(0).int().cuda()]
+        output_list = (weighted_probs > 0.5).int()
+
+        intersection, union, acc_iou = 0.0, 0.0, 0.0
+        for mask_i, output_i in zip(masks_list, output_list):
+            intersection_i, union_i, _ = intersectionAndUnionGPU(
+                output_i.contiguous().clone(), mask_i.contiguous(), 2, ignore_index=255
+            )
+            intersection += intersection_i
+            union += union_i
+            acc_iou += intersection_i / (union_i + 1e-5)
+            acc_iou[union_i == 0] += 1.0  # no-object target
+        intersection, union = intersection.cpu().numpy(), union.cpu().numpy()
+        acc_iou = acc_iou.cpu().numpy() / masks.shape[0]
+        intersection_meter.update(intersection), union_meter.update(
+            union
+        ), acc_iou_meter.update(acc_iou, n=masks.shape[0])
+
+        #print(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) > 0.5], F.sigmoid(weighted_probs)[F.sigmoid(weighted_probs) > 0.5])
+        print(len(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) > 0.5]), len(weighted_probs[weighted_probs> 0.5]), len(weighted_probs[weighted_probs> 0.5]) - len(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) > 0.5]))
+        #print(acc_iou)
+        #pdb.set_trace()
+
+        #output_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
+        #text_output = tokenizer.decode(output_ids, skip_special_tokens=False)
+        #text_output = text_output.replace("\n", "").replace("  ", " ")
+        #print("text_output: ", text_output)
+
+    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
+    ciou = iou_class[1]
+    giou = acc_iou_meter.avg[1]
+    print("CIoU, GIoU:", ciou, giou)
 
 
 if __name__ == "__main__":
