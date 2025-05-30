@@ -88,7 +88,7 @@ def add_diffusion_noise(image_tensor, noise_step):
     return image_tensor_cd
 
 def gaussian_noise(x, bound=0.01):
-    lam = torch.distributions.Beta(1,1).sample((x.shape[0], 1, 1, 1)).to(x.device)
+    lam = 0.5
     noise_img = torch.randn_like(x) * torch.rand(1).to(x.device) * bound
     return lam * x + (1 - lam) * noise_img
 
@@ -107,65 +107,6 @@ def preprocess(
     padw = img_size - w
     x = F.pad(x, (0, padw, 0, padh))
     return x
-
-def validate(val_loader, model_engine, epoch, writer, args):
-    intersection_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
-    union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
-    acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
-
-    model_engine.eval()
-
-    for input_dict in tqdm.tqdm(val_loader):
-        torch.cuda.empty_cache()
-
-        input_dict = dict_to_cuda(input_dict)
-        if args.precision == "fp16":
-            input_dict["images"] = input_dict["images"].half()
-            input_dict["images_clip"] = input_dict["images_clip"].half()
-        elif args.precision == "bf16":
-            input_dict["images"] = input_dict["images"].bfloat16()
-            input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
-        else:
-            input_dict["images"] = input_dict["images"].float()
-            input_dict["images_clip"] = input_dict["images_clip"].float()
-
-        with torch.no_grad():
-            output_dict = model_engine(**input_dict)
-
-        pred_masks = output_dict["pred_masks"]
-        masks_list = output_dict["gt_masks"][0].int()
-        output_list = (pred_masks[0] > 0).int()
-        assert len(pred_masks) == 1
-
-        intersection, union, acc_iou = 0.0, 0.0, 0.0
-        for mask_i, output_i in zip(masks_list, output_list):
-            intersection_i, union_i, _ = intersectionAndUnionGPU(
-                output_i.contiguous().clone(), mask_i.contiguous(), 2, ignore_index=255
-            )
-            intersection += intersection_i
-            union += union_i
-            acc_iou += intersection_i / (union_i + 1e-5)
-            acc_iou[union_i == 0] += 1.0  # no-object target
-        intersection, union = intersection.cpu().numpy(), union.cpu().numpy()
-        acc_iou = acc_iou.cpu().numpy() / masks_list.shape[0]
-        intersection_meter.update(intersection), union_meter.update(
-            union
-        ), acc_iou_meter.update(acc_iou, n=masks_list.shape[0])
-
-    intersection_meter.all_reduce()
-    union_meter.all_reduce()
-    acc_iou_meter.all_reduce()
-
-    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
-    ciou = iou_class[1]
-    giou = acc_iou_meter.avg[1]
-
-    if args.local_rank == 0:
-        writer.add_scalar("val/giou", giou, epoch)
-        writer.add_scalar("val/ciou", ciou, epoch)
-        print("giou: {:.4f}, ciou: {:.4f}".format(giou, ciou))
-
-    return giou, ciou
 
 def main(args):
     args = parse_args(args)
@@ -236,23 +177,6 @@ def main(args):
     )
     print("Val set length:", val_dataset.__len__())
 
-    val_sampler = None
-    val_loader = torch.utils.data.DataLoader(
-            val_dataset,
-            batch_size=args.val_batch_size,
-            shuffle=False,
-            num_workers=args.workers,
-            pin_memory=False,
-            sampler=val_sampler,
-            collate_fn=partial(
-                collate_fn,
-                tokenizer=tokenizer,
-                conv_type=args.conv_type,
-                use_mm_start_end=args.use_mm_start_end,
-                local_rank=args.local_rank,
-        ),
-    )
-
     if args.precision == "bf16":
         model = model.bfloat16().cuda()
     elif (
@@ -318,16 +242,18 @@ def main(args):
                 max_new_tokens=512,
                 tokenizer=tokenizer,
         )
-        P_probs, Q_probs = F.sigmoid(pred_masks[0]), F.sigmoid(cd_pred_masks[0])
+        P_logits, Q_logits = pred_masks[0], cd_pred_masks[0]
+        P_probs, Q_probs = F.sigmoid(P_logits), F.sigmoid(Q_logits)
 
-        IW = (P_probs / Q_probs.clamp(min=1e-6)).clamp(max=1e4)
-        weighted_probs = torch.sqrt(IW * P_probs)
+        IW = (P_probs / Q_probs.clamp(min=1e-4))
+        IW_logits = IW * P_logits
+        IW_probs = F.sigmoid(IW_logits)
 
         masks_list = [masks.squeeze(0).int().cuda()]
-        output_list = (weighted_probs > 0.5).int()
+        output = (IW_probs >= 0.5).int() ### Baseline: CIoU, GIoU: 0.5556137 0.54342693
 
         intersection, union, acc_iou = 0.0, 0.0, 0.0
-        for mask_i, output_i in zip(masks_list, output_list):
+        for mask_i, output_i in zip(masks_list, output):
             intersection_i, union_i, _ = intersectionAndUnionGPU(
                 output_i.contiguous().clone(), mask_i.contiguous(), 2, ignore_index=255
             )
@@ -341,15 +267,8 @@ def main(args):
             union
         ), acc_iou_meter.update(acc_iou, n=masks.shape[0])
 
-        #print(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) > 0.5], F.sigmoid(weighted_probs)[F.sigmoid(weighted_probs) > 0.5])
-        print(len(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) > 0.5]), len(weighted_probs[weighted_probs> 0.5]), len(weighted_probs[weighted_probs> 0.5]) - len(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) > 0.5]))
-        #print(acc_iou)
-        #pdb.set_trace()
-
-        #output_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
-        #text_output = tokenizer.decode(output_ids, skip_special_tokens=False)
-        #text_output = text_output.replace("\n", "").replace("  ", " ")
-        #print("text_output: ", text_output)
+        #print(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) > 0.5], F.sigmoid(IW_probs)[F.sigmoid(IW_probs) > 0.5])
+        print(len(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) >= 0.5]), len(IW_probs[IW_probs >= 0.5]), len(IW_probs[IW_probs >= 0.5]) - len(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) >= 0.5]))
 
     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
     ciou = iou_class[1]
