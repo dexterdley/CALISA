@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0 python ./lisa_expt/eval.py --version='xinlai/LISA-13B-llama2-v1' --workers=0 --noise=0.25

@@ -231,26 +231,30 @@ def main(args):
                 original_size_list=[tuple(masks.squeeze(0).shape)],
                 max_new_tokens=512,
                 tokenizer=tokenizer,
+                noise=args.noise
         )
-
+        
         cd_output_ids, cd_pred_masks = model.evaluate(
-                images_clip.bfloat16().unsqueeze(0).cuda(),
+                gaussian_noise(images_clip.unsqueeze(0), args.noise).bfloat16().cuda(),
                 gaussian_noise(images.unsqueeze(0), args.noise).bfloat16().cuda(),
                 input_ids,
                 resize_list=[resize],
                 original_size_list=[tuple(masks.squeeze(0).shape)],
                 max_new_tokens=512,
                 tokenizer=tokenizer,
+                noise=args.noise
         )
         P_logits, Q_logits = pred_masks[0], cd_pred_masks[0]
         P_probs, Q_probs = F.sigmoid(P_logits), F.sigmoid(Q_logits)
+        
+        #IW = (P_logits / Q_logits.clamp(min=1e-4))
+        #IW_logits = IW * P_logits
+        #IW_probs = F.sigmoid(IW)
+        IW_probs = P_probs
 
-        IW = (P_probs / Q_probs.clamp(min=1e-4))
-        IW_logits = IW * P_logits
-        IW_probs = F.sigmoid(IW_logits)
 
         masks_list = [masks.squeeze(0).int().cuda()]
-        output = (IW_probs >= 0.5).int() ### Baseline: CIoU, GIoU: 0.5556137 0.54342693
+        output = (IW_probs >= 0.5).int() ### Baseline: CIoU, GIoU: 0.5556137 0.54342693, probs ver: CIoU, GIoU: 0.5635947 0.54773134 (best)
 
         intersection, union, acc_iou = 0.0, 0.0, 0.0
         for mask_i, output_i in zip(masks_list, output):
