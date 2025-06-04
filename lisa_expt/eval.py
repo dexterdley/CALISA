@@ -234,11 +234,27 @@ def main(args):
                 noise=args.noise
         )
         
-        P_logits = pred_masks[0]
-        #P_probs = F.sigmoid(P_logits)
+        cd_output_ids, cd_pred_masks = model.evaluate(
+                gaussian_noise(images_clip.unsqueeze(0), args.noise).bfloat16().cuda(),
+                gaussian_noise(images.unsqueeze(0), args.noise).bfloat16().cuda(),
+                input_ids,
+                resize_list=[resize],
+                original_size_list=[tuple(masks.squeeze(0).shape)],
+                max_new_tokens=512,
+                tokenizer=tokenizer,
+                noise=args.noise
+        )
+        P_logits, Q_logits = pred_masks[0], cd_pred_masks[0]
+        P_probs, Q_probs = F.sigmoid(P_logits), F.sigmoid(Q_logits)
         
+        #IW = (P_logits / Q_logits.clamp(min=1e-4))
+        #IW_logits = IW * P_logits
+        #IW_probs = F.sigmoid(IW)
+        IW_probs = P_probs
+
+
         masks_list = [masks.squeeze(0).int().cuda()]
-        output = (P_logits > 0.0).int() ### Baseline: CIoU, GIoU: 0.5556137 0.54342693, probs ver: CIoU, GIoU: 0.56486994 0.547495 (best)
+        output = (IW_probs >= 0.5).int() ### Baseline: CIoU, GIoU: 0.5556137 0.54342693, probs ver: CIoU, GIoU: 0.5635947 0.54773134 (best)
 
         intersection, union, acc_iou = 0.0, 0.0, 0.0
         for mask_i, output_i in zip(masks_list, output):
@@ -256,7 +272,7 @@ def main(args):
         ), acc_iou_meter.update(acc_iou, n=masks.shape[0])
 
         #print(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) > 0.5], F.sigmoid(IW_probs)[F.sigmoid(IW_probs) > 0.5])
-        #print(len(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) >= 0.5]), len(IW_probs[IW_probs >= 0.5]), len(IW_probs[IW_probs >= 0.5]) - len(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) >= 0.5]))
+        print(len(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) >= 0.5]), len(IW_probs[IW_probs >= 0.5]), len(IW_probs[IW_probs >= 0.5]) - len(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) >= 0.5]))
 
     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
     ciou = iou_class[1]
