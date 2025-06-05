@@ -3,6 +3,15 @@ from enum import Enum
 import numpy as np
 import torch
 import torch.distributed as dist
+import random
+
+def set_deterministic(deterministic: bool, seed: int):
+    if deterministic:
+        random.seed(int(seed))
+        np.random.seed(int(seed))
+        torch.manual_seed(int(seed))
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = -200

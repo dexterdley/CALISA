@@ -3,6 +3,7 @@ from typing import List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision
 from transformers import BitsAndBytesConfig, CLIPVisionModel
 
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
@@ -13,6 +14,29 @@ from .llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM,
 from .segment_anything import build_sam_vit_h
 import pdb
 eps = 1e-5
+
+def add_diffusion_noise(image_tensor, noise_step):
+    num_steps = 1000  # Number of diffusion steps
+
+    # decide beta in each step
+    betas = torch.linspace(-6, 6, num_steps)
+    betas = torch.sigmoid(betas) * (0.5e-2 - 1e-5) + 1e-5
+
+    # decide alphas in each step
+    alphas = 1 - betas
+    alphas_prod = torch.cumprod(alphas, dim=0)
+    alphas_bar_sqrt = torch.sqrt(alphas_prod)
+    one_minus_alphas_bar_sqrt = torch.sqrt(1 - alphas_prod)
+
+    def q_x(x_0, t):
+        noise = torch.randn_like(x_0)
+        alphas_t = alphas_bar_sqrt[t]
+        alphas_1_m_t = one_minus_alphas_bar_sqrt[t]
+        return (alphas_t * x_0 + alphas_1_m_t * noise)
+
+    noisy_image = image_tensor.clone()
+    image_tensor_cd = q_x(noisy_image, int(noise_step))
+    return image_tensor_cd
 
 def gaussian_noise(x, bound=0.01):
     lam = 0.5
@@ -357,7 +381,8 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         original_size_list,
         max_new_tokens=32,
         tokenizer=None,
-        noise=None
+        noise=None,
+        importance=False
     ):
         with torch.no_grad():
             outputs = self.generate(
@@ -401,9 +426,9 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                 pred_embeddings_.append(pred_embeddings[start_i:end_i])
             pred_embeddings = pred_embeddings_
 
-
             cd_outputs = self.generate(
                 images=gaussian_noise(images_clip, bound=noise).bfloat16(),
+                #images=add_diffusion_noise(images_clip, noise).bfloat16().cuda(),
                 input_ids=input_ids,
                 max_new_tokens=max_new_tokens,
                 num_beams=1,
@@ -438,10 +463,10 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             cd_pred_embeddings = cd_pred_embeddings_
 
             ### Visual encoder
-
-            corrupt_images = gaussian_noise(images, bound=noise)
             image_embeddings = self.get_visual_embs(images)
-            cd_image_embeddings = self.get_visual_embs(corrupt_images.bfloat16())
+            corrupt_images = gaussian_noise(images, bound=noise).bfloat16()
+            #corrupt_images = add_diffusion_noise(images, noise).bfloat16()
+            cd_image_embeddings = self.get_visual_embs(corrupt_images)
 
             multimask_output = False
             pred_masks = []
@@ -455,25 +480,26 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                     masks=None,
                     text_embeds=pred_embeddings[i].unsqueeze(1),
                 )
-
-                (
-                    cd_sparse_embeddings,
-                    cd_dense_embeddings,
-                ) = self.model.visual_model.prompt_encoder(
-                    points=None,
-                    boxes=None,
-                    masks=None,
-                    text_embeds=cd_pred_embeddings[i].unsqueeze(1),
-                )
-
                 sparse_embeddings = sparse_embeddings.to(image_embeddings.dtype)
-                cd_sparse_embeddings = cd_sparse_embeddings.to(image_embeddings.dtype)
 
-                IW_sparse_embeddings = F.sigmoid(sparse_embeddings/cd_sparse_embeddings) #work
-                sparse_embeddings *= IW_sparse_embeddings
-                
-                #IW_image_embeddings = F.sigmoid(image_embeddings/(cd_image_embeddings + eps))
-                #image_embeddings[i] = IW_image_embeddings * image_embeddings[i]
+                if importance == True:
+                    (
+                        cd_sparse_embeddings,
+                        cd_dense_embeddings,
+                    ) = self.model.visual_model.prompt_encoder(
+                        points=None,
+                        boxes=None,
+                        masks=None,
+                        text_embeds=cd_pred_embeddings[i].unsqueeze(1),
+                    )
+
+                    cd_sparse_embeddings = cd_sparse_embeddings.to(image_embeddings.dtype)
+
+                    IW_sparse_embeddings = F.sigmoid(sparse_embeddings/cd_sparse_embeddings) #work
+                    sparse_embeddings = IW_sparse_embeddings * sparse_embeddings
+
+                    IW_image_embeddings = F.sigmoid(image_embeddings[i])/F.sigmoid(cd_image_embeddings[i])
+                    image_embeddings[i] = IW_image_embeddings * image_embeddings[i]
 
                 low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
                     image_embeddings=image_embeddings[i].unsqueeze(0),
