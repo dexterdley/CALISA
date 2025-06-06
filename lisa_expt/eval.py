@@ -217,10 +217,10 @@ def main(args):
             replace_token = (
                 DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
             )
-            conversation = conversation[0].replace(
+            prompt = conversation[0].replace(
                 DEFAULT_IMAGE_TOKEN, replace_token
             )
-        input_ids = tokenizer_image_token(conversation, tokenizer, return_tensors="pt")
+        input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
         input_ids = input_ids.unsqueeze(0).cuda()
         
         output_ids, pred_masks = model.evaluate(
@@ -238,7 +238,7 @@ def main(args):
         P_logits = pred_masks[0]
         
         masks_list = [masks.squeeze(0).int().cuda()]
-        output = (P_logits > 0.0).int() ### Baseline: CIoU, GIoU: 0.5556137 0.54342693, probs ver: CIoU, GIoU: 0.5635947 0.54773134 (best)
+        output = (P_logits.sigmoid() >= 0.5).int() ### Baseline: CIoU, GIoU: 0.5556137 0.54342693, probs ver: CIoU, GIoU: 0.5635947 0.54773134 (best)
 
         intersection, union, acc_iou = 0.0, 0.0, 0.0
         for mask_i, output_i in zip(masks_list, output):
