@@ -18,6 +18,8 @@ project_root = os.path.abspath(os.path.join(current_script_dir, '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root) # Insert at the beginning for higher priority
 
+from ECE import _calculate_ece
+
 from model.LISA import LISAForCausalLM
 from model.llava import conversation as conversation_lib
 from model.llava.mm_utils import tokenizer_image_token
@@ -51,6 +53,7 @@ def parse_args(args):
     parser.add_argument("--val_batch_size", default=1, type=int)
     parser.add_argument("--workers", default=4, type=int)
     parser.add_argument("--noise", default=0.5, type=float)
+    parser.add_argument("--importance", default=True, type=bool)
 
     parser.add_argument("--local-rank", default=0, type=int, help="node rank")
     parser.add_argument("--load_in_8bit", action="store_true", default=False)
@@ -209,6 +212,8 @@ def main(args):
     union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
     acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
 
+    ECE_list = []
+
     for i in tqdm.tqdm(range(val_dataset.__len__())):
         image_path, images, images_clip, conversation, masks, label, resize, questions, sampled_classes, inference = val_dataset.__getitem__(i)
 
@@ -223,7 +228,7 @@ def main(args):
         input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
         input_ids = input_ids.unsqueeze(0).cuda()
         
-        output_ids, pred_masks = model.evaluate(
+        output_ids, pred_masks, low_res_masks = model.evaluate(
                 images_clip.bfloat16().unsqueeze(0).cuda(),
                 images.bfloat16().unsqueeze(0).cuda(),
                 input_ids,
@@ -232,13 +237,34 @@ def main(args):
                 max_new_tokens=512,
                 tokenizer=tokenizer,
                 noise=args.noise,
-                importance=True
+                importance=args.importance
+        )
+
+        cd_output_ids, cd_pred_masks, _ = model.evaluate(
+                images_clip.bfloat16().unsqueeze(0).cuda(),
+                gaussian_noise(images.unsqueeze(0), args.noise).bfloat16().cuda(),
+                input_ids,
+                resize_list=[resize],
+                original_size_list=[tuple(masks.squeeze(0).shape)],
+                max_new_tokens=512,
+                tokenizer=tokenizer,
+                noise=args.noise,
+                importance=args.importance
         )
         
-        P_logits = pred_masks[0]
-        
+        #P_logits = pred_masks[0]
+        #P_probs = P_logits.sigmoid()
+
+        #masks_list = [masks.squeeze(0).int().cuda()]
+        #output = (P_probs >= 0.5).int() ### Baseline: CIoU, GIoU: 0.5556137 0.54342693, probs ver: CIoU, GIoU: 0.5635947 0.54773134 (best)
+
+        P_probs, Q_probs = F.sigmoid(pred_masks[0]), F.sigmoid(cd_pred_masks[0])
+
+        IW = (P_probs / Q_probs.clamp(min=1e-4))
+        IW_probs = F.sigmoid(IW * pred_masks[0])
+
         masks_list = [masks.squeeze(0).int().cuda()]
-        output = (P_logits.sigmoid() >= 0.5).int() ### Baseline: CIoU, GIoU: 0.5556137 0.54342693, probs ver: CIoU, GIoU: 0.5635947 0.54773134 (best)
+        output = (IW_probs >= 0.5).int()
 
         intersection, union, acc_iou = 0.0, 0.0, 0.0
         for mask_i, output_i in zip(masks_list, output):
@@ -258,10 +284,21 @@ def main(args):
         #print(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) > 0.5], F.sigmoid(IW_probs)[F.sigmoid(IW_probs) > 0.5])
         #print(len(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) >= 0.5]), len(IW_probs[IW_probs >= 0.5]), len(IW_probs[IW_probs >= 0.5]) - len(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) >= 0.5]))
 
+
+        low_res_GT = F.interpolate(masks.unsqueeze(0), (256, 256) ,mode="bilinear", align_corners=False)[0].reshape(1, 256, 256)
+        low_res_masks = F.interpolate(low_res_masks, (256, 256) ,mode="bilinear", align_corners=False)[0].reshape(1, 256, 256)
+        low_res_masks_probs = low_res_masks.sigmoid()
+        #pdb.set_trace()
+        ece = _calculate_ece(low_res_masks_probs.flatten().cpu(), low_res_GT.flatten(), n_bins=15)
+        ECE_list.append(ece)
+
+        #pdb.set_trace()
+
     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
     ciou = iou_class[1]
     giou = acc_iou_meter.avg[1]
     print("CIoU, GIoU:", ciou, giou)
+    print("ECE:", sum(ECE_list)/len(ECE_list))
 
 
 if __name__ == "__main__":

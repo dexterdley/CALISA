@@ -450,7 +450,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                     cd_sparse_embeddings = cd_sparse_embeddings.to(image_embeddings.dtype)
 
                     IW_sparse_embeddings = F.sigmoid(sparse_embeddings/cd_sparse_embeddings) #work
-                    sparse_embeddings *= IW_sparse_embeddings
+                    sparse_embeddings = IW_sparse_embeddings * sparse_embeddings
 
                     IW_image_embeddings = F.sigmoid(image_embeddings[i])/F.sigmoid(cd_image_embeddings[i])
                     image_embeddings[i] = IW_image_embeddings * image_embeddings[i]
@@ -469,4 +469,4 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                 )
                 pred_masks.append(pred_mask[:, 0])
                 # pdb.set_trace()
-        return output_ids, pred_masks
+        return output_ids, pred_masks, low_res_masks
