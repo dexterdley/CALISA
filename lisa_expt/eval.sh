@@ -1,1 +1,3 @@
-CUDA_VISIBLE_DEVICES=0 python ./lisa_expt/eval.py --version='xinlai/LISA-13B-llama2-v1' --workers=0 --noise=0.25
+export OPENBLAS_NUM_THREADS=64
+CUDA_VISIBLE_DEVICES=0 python ./lisa_expt/eval.py --version='xinlai/LISA-13B-llama2-v1' --workers=0 --noise=0.750 --importance=True
+CUDA_VISIBLE_DEVICES=0 python ./lisa_expt/eval.py --version='xinlai/LISA-13B-llama2-v1' --workers=0 --noise=0.750 --importance=False

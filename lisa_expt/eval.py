@@ -18,7 +18,7 @@ project_root = os.path.abspath(os.path.join(current_script_dir, '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root) # Insert at the beginning for higher priority
 
-from ECE import _calculate_ece
+from ECE import _calculate_ece, make_model_diagrams
 
 from model.LISA import LISAForCausalLM
 from model.llava import conversation as conversation_lib
@@ -239,32 +239,12 @@ def main(args):
                 noise=args.noise,
                 importance=args.importance
         )
-
-        cd_output_ids, cd_pred_masks, _ = model.evaluate(
-                images_clip.bfloat16().unsqueeze(0).cuda(),
-                gaussian_noise(images.unsqueeze(0), args.noise).bfloat16().cuda(),
-                input_ids,
-                resize_list=[resize],
-                original_size_list=[tuple(masks.squeeze(0).shape)],
-                max_new_tokens=512,
-                tokenizer=tokenizer,
-                noise=args.noise,
-                importance=args.importance
-        )
         
-        #P_logits = pred_masks[0]
-        #P_probs = P_logits.sigmoid()
-
-        #masks_list = [masks.squeeze(0).int().cuda()]
-        #output = (P_probs >= 0.5).int() ### Baseline: CIoU, GIoU: 0.5556137 0.54342693, probs ver: CIoU, GIoU: 0.5635947 0.54773134 (best)
-
-        P_probs, Q_probs = F.sigmoid(pred_masks[0]), F.sigmoid(cd_pred_masks[0])
-
-        IW = (P_probs / Q_probs.clamp(min=1e-4))
-        IW_probs = F.sigmoid(IW * pred_masks[0])
+        P_logits = pred_masks[0]
+        P_probs = P_logits.sigmoid()
 
         masks_list = [masks.squeeze(0).int().cuda()]
-        output = (IW_probs >= 0.5).int()
+        output = (P_logits > 0.0).int() ### Baseline: CIoU, GIoU: 0.5556137 0.54342693, probs ver: CIoU, GIoU: 0.5635947 0.54773134 (best)
 
         intersection, union, acc_iou = 0.0, 0.0, 0.0
         for mask_i, output_i in zip(masks_list, output):
@@ -286,10 +266,12 @@ def main(args):
 
 
         low_res_GT = F.interpolate(masks.unsqueeze(0), (256, 256) ,mode="bilinear", align_corners=False)[0].reshape(1, 256, 256)
-        low_res_masks = F.interpolate(low_res_masks, (256, 256) ,mode="bilinear", align_corners=False)[0].reshape(1, 256, 256)
+        low_res_masks = F.interpolate(low_res_masks, (256, 256) ,mode="bilinear", align_corners=False)[0].reshape(1, 256, 256).cpu()
         low_res_masks_probs = low_res_masks.sigmoid()
+        low_res_masks_probs[low_res_masks < 1e-3] = 0
         #pdb.set_trace()
-        ece = _calculate_ece(low_res_masks_probs.flatten().cpu(), low_res_GT.flatten(), n_bins=15)
+        ece = _calculate_ece(low_res_masks_probs.flatten(), low_res_GT.flatten(), n_bins=15)
+        #ece = expected_calibration_error(low_res_masks_probs.flatten(), (low_res_masks_probs>=0.5).bool(), low_res_GT.flatten(), num_bins=15)
         ECE_list.append(ece)
 
         #pdb.set_trace()
