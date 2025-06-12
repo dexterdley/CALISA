@@ -14,7 +14,6 @@ from .llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM,
 from .segment_anything import build_sam_vit_h
 
 import os
-os.environ["OPENBLAS_NUM_THREADS"] = "64"
 import numpy as np
 from sklearn.mixture import GaussianMixture as GMM
 import pdb
