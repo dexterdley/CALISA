@@ -466,14 +466,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                     dense_prompt_embeddings=dense_embeddings,
                     multimask_output=multimask_output,
                 )
-                """
-                B = low_res_masks.int().squeeze(0).cpu().numpy().astype(np.uint8)
-                B_reshaped = B.reshape((-1, 1))
 
-                gmm_model = GMM(n_components=2, covariance_type='full', random_state=42).fit(B_reshaped)
-                gmm_mask_flat = gmm_model.predict(B_reshaped)
-                gmm_mask = gmm_mask_flat.reshape(B.shape)
-                """
                 pred_mask = self.model.visual_model.postprocess_masks(
                     low_res_masks,
                     input_size=resize_list[i],
