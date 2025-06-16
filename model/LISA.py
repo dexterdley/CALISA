@@ -408,7 +408,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                 output_hidden_states=True,
                 return_dict_in_generate=True,
             )
-
+            
             cd_outputs = self.generate(
                 images=gaussian_noise(images_clip, bound=noise).bfloat16(),
                 input_ids=input_ids,
@@ -419,7 +419,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             )
 
             output_ids, pred_embeddings, seg_token_offset = process_generation_output(outputs)
-            cd_output_ids, cd_pred_embeddings, _ = process_generation_output(cd_outputs, seg_token_offset)
+            cd_output_ids, cd_pred_embeddings, _ = process_generation_output(cd_outputs)
 
             ### Visual encoder
             image_embeddings = self.get_visual_embs(images)
@@ -456,8 +456,8 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                     IW_sparse_embeddings = F.sigmoid(sparse_embeddings/cd_sparse_embeddings) #work
                     sparse_embeddings = IW_sparse_embeddings * sparse_embeddings
 
-                    IW_image_embeddings = F.sigmoid(image_embeddings[i])/F.sigmoid(cd_image_embeddings[i])
-                    image_embeddings[i] = IW_image_embeddings * image_embeddings[i]
+                    IW_image_embeddings = F.sigmoid(image_embeddings)/F.sigmoid(cd_image_embeddings)
+                    image_embeddings = IW_image_embeddings * image_embeddings
 
                 low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
                     image_embeddings=image_embeddings[i].unsqueeze(0),
@@ -467,11 +467,23 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                     multimask_output=multimask_output,
                 )
 
+                cd_low_res_masks, cd_iou_predictions = self.model.visual_model.mask_decoder(
+                    image_embeddings=cd_image_embeddings[i].unsqueeze(0),
+                    image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
+                    sparse_prompt_embeddings=cd_sparse_embeddings,
+                    dense_prompt_embeddings=cd_dense_embeddings,
+                    multimask_output=multimask_output,
+                )
+
                 pred_mask = self.model.visual_model.postprocess_masks(
                     low_res_masks,
                     input_size=resize_list[i],
                     original_size=original_size_list[i],
                 )
+
+                IW_masks = F.sigmoid(low_res_masks)/F.sigmoid(cd_low_res_masks)
+                low_res_masks *= IW_masks
+                
                 pred_masks.append(pred_mask[:, 0])
-                # pdb.set_trace()
+                #pdb.set_trace()
         return output_ids, pred_masks, low_res_masks

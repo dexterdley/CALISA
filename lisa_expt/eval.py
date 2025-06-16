@@ -249,33 +249,11 @@ def main(args):
                 importance=args.importance
         )
         
-        cd_output_ids, cd_pred_masks, cd_low_res_masks = model.evaluate(
-                gaussian_noise(images_clip.unsqueeze(0), args.noise).bfloat16().cuda(),
-                gaussian_noise(images.unsqueeze(0), args.noise).bfloat16().cuda(),
-                input_ids,
-                resize_list=[resize],
-                original_size_list=[tuple(masks.squeeze(0).shape)],
-                max_new_tokens=512,
-                noise=args.noise,
-                tokenizer=tokenizer,
-                importance=False
-        )
-        
-        #P_logits = pred_masks[0]
-        #P_probs = P_logits.sigmoid()
-
-        #masks_list = [masks.squeeze(0).int().cuda()]
-        #output = (P_probs >= 0.5).int() ### Baseline: CIoU, GIoU: 0.5556137 0.54342693, probs ver: CIoU, GIoU: 0.5635947 0.54773134 (best)
-
-        P_logits, Q_logits = pred_masks[0], cd_pred_masks[0]
-        P_probs, Q_probs = P_logits.sigmoid(), Q_logits.sigmoid()
-
-        IW = P_probs/Q_probs
-        IW_logits = IW * P_logits
-        IW_probs = F.sigmoid(IW_logits)
+        P_logits = pred_masks[0]
+        P_probs = P_logits.sigmoid()
 
         masks_list = [masks.squeeze(0).int().cuda()]
-        output = (IW_probs >= 0.55).int() ### Baseline: CIoU, GIoU: 0.5556137 0.54342693, probs ver: CIoU, GIoU: 0.5635947 0.54773134 (best)
+        output = (P_probs >= 0.5).int() ### Baseline: CIoU, GIoU: 0.5556137 0.54342693, ECE: 0.304 probs ver: CIoU, GIoU: 0.5635947 0.54773134 (best)
 
         intersection, union, acc_iou = 0.0, 0.0, 0.0
         for mask_i, output_i in zip(masks_list, output):
@@ -292,28 +270,14 @@ def main(args):
             union
         ), acc_iou_meter.update(acc_iou, n=masks.shape[0])
 
-        #print(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) > 0.5], F.sigmoid(IW_probs)[F.sigmoid(IW_probs) > 0.5])
-        #print(len(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) >= 0.5]), len(IW_probs[IW_probs >= 0.5]), len(IW_probs[IW_probs >= 0.5]) - len(F.sigmoid(pred_masks[0])[F.sigmoid(pred_masks[0]) >= 0.5]))
-
-
         low_res_GT = F.interpolate(masks.unsqueeze(0), (256, 256) ,mode="bilinear", align_corners=False)[0].reshape(1, 256, 256)
         low_res_masks = F.interpolate(low_res_masks, (256, 256) ,mode="bilinear", align_corners=False)[0].reshape(1, 256, 256).cpu()
-        '''
-        if args.importance:
-            cd_low_res_masks = F.interpolate(cd_low_res_masks, (256, 256) ,mode="bilinear", align_corners=False)[0].reshape(1, 256, 256).cpu()
-            low_res_masks_probs, cd_low_res_masks_probs = F.sigmoid(low_res_masks), F.sigmoid(cd_low_res_masks)
-            low_res_masks_probs[low_res_masks_probs < 1e-4] = 0 #ignore v small probs
-            IW =  F.sigmoid(low_res_masks/cd_low_res_masks)
-            low_res_masks_probs = IW * low_res_masks_probs
-        else:
-        '''
+        
         low_res_masks_probs = F.sigmoid(low_res_masks)
         low_res_masks_probs[low_res_masks_probs < 1e-5] = 0 #ignore v small probs
-        #pdb.set_trace()
-        ece = _calculate_ece(low_res_masks_probs.flatten(), low_res_GT.flatten(), n_bins=10)
-        #ece = expected_calibration_error(low_res_masks_probs.flatten(), (low_res_masks_probs>=0.5).bool(), low_res_GT.flatten(), num_bins=15)
-        ECE_list.append(ece)
 
+        ece = _calculate_ece(low_res_masks_probs.flatten(), low_res_GT.flatten(), n_bins=15)
+        ECE_list.append(ece)
         #pdb.set_trace()
 
     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
