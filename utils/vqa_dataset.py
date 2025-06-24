@@ -7,10 +7,10 @@ import torch
 import torch.nn.functional as F
 from transformers import CLIPImageProcessor
 
-from model.llava import conversation as conversation_lib
+from model.llava1p5 import conversation as conversation_lib
 from model.segment_anything.utils.transforms import ResizeLongestSide
 
-from .utils import DEFAULT_IMAGE_TOKEN
+from .utils import DEFAULT_IMAGE_TOKEN, DEFAULT_PURE_CONV
 
 
 def preprocess_multimodal(source, mm_use_im_start_end):
@@ -58,7 +58,10 @@ class VQADataset(torch.utils.data.Dataset):
         self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
 
         DATA_DIR = os.path.join(base_image_dir, "llava_dataset")
-        self.vqa_image_root = os.path.join(base_image_dir, "coco/train2017")
+        if vqa_data == 'llava_v1_5_mix665k':
+            self.vqa_image_root = base_image_dir
+        else:
+            self.vqa_image_root = os.path.join(base_image_dir, "coco/train2017")
         with open(os.path.join(DATA_DIR, "{}.json".format(vqa_data))) as f:
             vqa_data = json.load(f)
         self.vqa_data = vqa_data
@@ -83,7 +86,22 @@ class VQADataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         idx = random.randint(0, len(self.vqa_data) - 1)
         item = self.vqa_data[idx]
-        image_path = os.path.join(self.vqa_image_root, item["image"])
+
+        if 'image' not in item:
+            return self.__getitem__(0)
+
+        image_path = item["image"]
+
+        # convert image type for OCR VQA dataset
+        if 'ocr' in image_path:
+            if not os.path.exists(os.path.join(self.base_image_dir, image_path)):
+                image_path = image_path.replace(".jpg", ".png")
+        # convert image for VG dataset
+        elif 'VG_100K' in image_path:
+            image_path = image_path.replace('VG_100K_2', 'images')
+            image_path = image_path.replace('VG_100K', 'images')
+
+        image_path = os.path.join(self.vqa_image_root, image_path)
         image = cv2.imread(image_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         ori_size = image.shape[:2]
@@ -92,6 +110,8 @@ class VQADataset(torch.utils.data.Dataset):
         ][
             0
         ]  # preprocess image for clip
+
+        # print("vqa: image_path: ", image_path)
 
         image = self.transform.apply_image(image)  # preprocess image for sam
         resize = image.shape[:2]
@@ -111,7 +131,10 @@ class VQADataset(torch.utils.data.Dataset):
         for j, sentence in enumerate(source):
             role = roles[sentence["from"]]
             assert role == conv.roles[j % 2], f"{i}"
-            conv.append_message(role, sentence["value"])
+            if role == 'USER':
+                conv.append_message(role, sentence["value"]+ DEFAULT_PURE_CONV)
+            else:
+                conv.append_message(role, sentence["value"])
         conversations.append(conv.get_prompt())
 
         questions = conversations

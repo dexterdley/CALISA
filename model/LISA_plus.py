@@ -3,19 +3,16 @@ from typing import List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision
 from transformers import BitsAndBytesConfig, CLIPVisionModel
 
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          DEFAULT_IMAGE_PATCH_TOKEN)
-
-from .llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM,
+from .llava1p5.model.language_model.llava_llama import (LlavaLlamaForCausalLM,
                                                      LlavaLlamaModel)
 from .segment_anything import build_sam_vit_h
 
-import os
+from scipy.optimize import linear_sum_assignment
 import numpy as np
-from sklearn.mixture import GaussianMixture as GMM
 import pdb
 eps = 1e-5
 
@@ -23,12 +20,6 @@ def gaussian_noise(x, bound=0.01):
     lam = 0.5
     noise_img = torch.randn_like(x) * torch.rand(1).to(x.device) * bound
     return lam * x + (1 - lam) * noise_img
-
-def generate_HPF_image(original_image, lpf_image, sharpening_amount=1.5):
-    HPF_details = original_image - lpf_image
-    HPF_img = original_image + HPF_details * sharpening_amount
-    HPF_img = torch.clamp(HPF_img, 0, 255)            
-    return HPF_img
 
 def dice_loss(
     inputs: torch.Tensor,
@@ -152,7 +143,11 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             self.dice_loss_weight = kwargs.pop("dice_loss_weight", None)
             self.bce_loss_weight = kwargs.pop("bce_loss_weight", None)
         else:
-            config.mm_vision_tower = config.vision_tower
+            config.mm_use_im_start_end = kwargs.pop("use_mm_start_end", True)
+            config.mm_vision_tower = kwargs.get("vision_tower", config.vision_tower)
+            self.ce_loss_weight = kwargs.pop("ce_loss_weight", None)
+            self.dice_loss_weight = kwargs.pop("dice_loss_weight", None)
+            self.bce_loss_weight = kwargs.pop("bce_loss_weight", None)
             
         self.seg_token_idx = kwargs.pop("seg_token_idx")
 
@@ -183,7 +178,103 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             return super().forward(**kwargs)
         return self.model_forward(**kwargs)
 
-    def model_forward(
+    def batch_dice_loss(self, inputs, targets):
+        inputs = inputs.sigmoid()
+        inputs = inputs.flatten(1)
+        targets = targets.flatten(1)
+        numerator = 2 * torch.einsum("nc,mc->nm", inputs, targets)
+        denominator = inputs.sum(-1)[:, None] + targets.sum(-1)[None, :]
+        loss = 1 - (numerator + 1) / (denominator + 1)
+        return loss
+    
+
+    def batch_sigmoid_ce_loss(self, inputs: torch.Tensor, targets: torch.Tensor):
+        """
+        Args:
+            inputs: A float tensor of arbitrary shape.
+                    The predictions for each example.
+            targets: A float tensor with the same shape as inputs. Stores the binary
+                    classification label for each element in inputs
+                    (0 for the negative class and 1 for the positive class).
+        Returns:
+            Loss tensor
+        """
+        hw = inputs.shape[1]
+
+        pos = F.binary_cross_entropy_with_logits(
+            inputs, torch.ones_like(inputs), reduction="none"
+        )
+        neg = F.binary_cross_entropy_with_logits(
+            inputs, torch.zeros_like(inputs), reduction="none"
+        )
+
+        loss = torch.einsum("nc,mc->nm", pos, targets) + torch.einsum(
+            "nc,mc->nm", neg, (1 - targets)
+        )
+
+        return loss / hw
+
+
+
+    def adjust_indices_order(self, pred_indices, gt_indices):
+        
+        adjusted_gt_indices = np.empty_like(gt_indices)
+
+        sorted_pred_indices = np.argsort(pred_indices)
+
+        for i, sorted_idx in enumerate(sorted_pred_indices):
+            adjusted_gt_indices[i] = gt_indices[sorted_idx]
+
+        return np.arange(len(pred_indices)), adjusted_gt_indices
+
+
+    def hungarian_matcher(self, pred_masks, gt_masks):
+        # Flatten the masks to two dimensions [N, H*W]
+        pred_masks = torch.stack([m.squeeze(0) for m in pred_masks]).flatten(1)
+        gt_masks = torch.stack([m.squeeze(0) for m in gt_masks]).flatten(1)
+
+        # Calculate Dice Loss for each pair of predicted and ground truth masks
+        dice_loss_cur = self.batch_dice_loss(pred_masks, gt_masks)
+        sigmoid_ce_loss_cur = self.batch_sigmoid_ce_loss(pred_masks, gt_masks)
+        
+        cost_matrix =  dice_loss_cur + sigmoid_ce_loss_cur
+
+        # Perform Hungarian Matching
+        pred_indices, gt_indices = linear_sum_assignment(cost_matrix.detach().cpu())
+        adjust_pred_indices, adjust_gt_indices = self.adjust_indices_order(pred_indices, gt_indices)
+
+        return adjust_pred_indices, adjust_gt_indices
+
+
+    def hungarian_matcher_batch(self, pred_masks, gt_masks, change_list):
+        reordered_gt_masks = []
+
+        for batch_idx, groups in enumerate(change_list):
+            batch_pred_masks = pred_masks[batch_idx]
+            batch_gt_masks = gt_masks[batch_idx]
+
+            reordered_batch_gt_masks = batch_gt_masks.clone()
+
+            for group in groups:
+                group_pred_masks = batch_pred_masks[group, :, :]
+                group_gt_masks = batch_gt_masks[group, :, :]
+
+                group_pred_masks = group_pred_masks.unsqueeze(1).flatten(1)
+                group_gt_masks = group_gt_masks.unsqueeze(1).flatten(1)
+
+                _, group_gt_indices = self.hungarian_matcher(group_pred_masks, group_gt_masks)
+
+                for idx, gt_idx in enumerate(group_gt_indices):
+                    reordered_batch_gt_masks[group[idx]] = batch_gt_masks[group[gt_idx]]
+
+            reordered_gt_masks.append(reordered_batch_gt_masks)
+
+        return reordered_gt_masks
+
+
+
+
+    def model_forward( #Can you segment the watch case and watch respectively in this image?
         self,
         images: torch.FloatTensor,
         images_clip: torch.FloatTensor,
@@ -195,6 +286,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         label_list: List[torch.Tensor],
         resize_list: List[tuple],
         inference: bool = False,
+        change_list: List[torch.Tensor] = [],
         **kwargs,
     ):
         image_embeddings = self.get_visual_embs(images)
@@ -209,9 +301,10 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             ],
             dim=1,
         )
+        image_token_len = (images_clip.shape[2] // 14) * (images_clip.shape[3] // 14)
         # hack for IMAGE_TOKEN_INDEX (we suppose that there is only one image, and it is in the front)
         seg_token_mask = torch.cat(
-            [torch.zeros((seg_token_mask.shape[0], 255)).bool().cuda(), seg_token_mask],
+            [torch.zeros((seg_token_mask.shape[0], image_token_len-1)).bool().cuda(), seg_token_mask],
             dim=1,
         )
 
@@ -313,6 +406,14 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         model_output = output
         gt_masks = masks_list
 
+        for list_id in range(len(change_list)):
+            if isinstance(change_list[list_id], list):
+                gt_masks_cur = self.hungarian_matcher_batch([pred_masks[list_id]], [gt_masks[list_id]], [change_list[list_id]])
+                gt_masks[list_id] = gt_masks_cur[0]
+
+            else:
+                gt_masks[list_id] = gt_masks[list_id] 
+        
         if inference:
             return {
                 "pred_masks": pred_masks,
@@ -348,7 +449,6 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         mask_bce_loss = self.bce_loss_weight * mask_bce_loss / (num_masks + 1e-8)
         mask_dice_loss = self.dice_loss_weight * mask_dice_loss / (num_masks + 1e-8)
         mask_loss = mask_bce_loss + mask_dice_loss
-
         loss = ce_loss + mask_loss
 
         return {
@@ -378,48 +478,34 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
 
                 seg_token_mask = output_ids[:, 1:] == self.seg_token_idx
                 # hack for IMAGE_TOKEN_INDEX (we suppose that there is only one image, and it is in the front)
+                image_token_len = (images_clip.shape[2] // 14) * (images_clip.shape[3] // 14)
                 seg_token_mask = torch.cat(
                     [
-                        torch.zeros((seg_token_mask.shape[0], 255)).bool().cuda(),
+                        torch.zeros((seg_token_mask.shape[0], image_token_len-1)).bool().cuda(),
                         seg_token_mask,
                     ],
                     dim=1,
                 )
                 hidden_states = []
+                assert len(self.model.text_hidden_fcs) == 1
                 hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states))
-
                 last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
                 pred_embeddings = last_hidden_state[seg_token_mask]
 
-                if seg_token_offset is None:
-                    seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
-                    seg_token_offset = seg_token_counts.cumsum(-1)
-                    seg_token_offset = torch.cat(
-                        [torch.zeros(1).long().cuda(), seg_token_offset], dim=0
-                    )
+                seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
+                seg_token_offset = seg_token_counts.cumsum(-1)
+                seg_token_offset = torch.cat(
+                    [torch.zeros(1).long().cuda(), seg_token_offset], dim=0
+                )
                 pred_embeddings_ = []
                 for i in range(len(seg_token_offset) - 1):
                     start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
                     pred_embeddings_.append(pred_embeddings[start_i:end_i])
                 pred_embeddings = pred_embeddings_
-
                 return output_ids, pred_embeddings, seg_token_offset
-
-            kernel_size = 3
-            LPF = torch.ones(1, 1, kernel_size, kernel_size).bfloat16().cuda() * (1.0 / (kernel_size * kernel_size))
-
-            LPF_img = F.conv2d(
-                images_clip,
-                LPF.repeat(3, 1, 1, 1),
-                padding="same",
-                groups=3
-            )
-
-            HPF_img = generate_HPF_image(images_clip, LPF_img)
-    
+            
             outputs = self.generate(
-                images=images_clip.bfloat16(),
-                # images=LPF_img.bfloat16(),
+                images=images_clip,
                 input_ids=input_ids,
                 max_new_tokens=max_new_tokens,
                 num_beams=1,
@@ -427,29 +513,9 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                 return_dict_in_generate=True,
             )
             
-            cd_outputs = self.generate(
-                images=gaussian_noise(images_clip, bound=noise).bfloat16(),
-                # images=LPF_img.bfloat16(),
-                input_ids=input_ids,
-                max_new_tokens=max_new_tokens,
-                num_beams=1,
-                output_hidden_states=True,
-                return_dict_in_generate=True,
-            )
-
             output_ids, pred_embeddings, seg_token_offset = process_generation_output(outputs)
-            cd_output_ids, cd_pred_embeddings, _ = process_generation_output(cd_outputs, seg_token_offset)
 
-            ### Visual encoder
             image_embeddings = self.get_visual_embs(images)
-            corrupt_images = gaussian_noise(images, bound=noise).bfloat16()
-            cd_image_embeddings = self.get_visual_embs(corrupt_images)
-
-            ### LPF, HPF
-            # LPF_images = F.conv2d(images, LPF.repeat(3, 1, 1, 1), padding="same", groups=3)
-            # image_embeddings = self.get_visual_embs(LPF_images)
-            # HPF_images = generate_HPF_image(images, LPF_images)
-            # cd_image_embeddings = self.get_visual_embs(LPF_images)
 
             multimask_output = False
             pred_masks = []
@@ -463,35 +529,8 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                     masks=None,
                     text_embeds=pred_embeddings[i].unsqueeze(1),
                 )
-                sparse_embeddings = sparse_embeddings.to(image_embeddings.dtype)
 
-                if importance == True:
-                    (
-                        cd_sparse_embeddings,
-                        cd_dense_embeddings,
-                    ) = self.model.visual_model.prompt_encoder(
-                        points=None,
-                        boxes=None,
-                        masks=None,
-                        text_embeds=cd_pred_embeddings[i].unsqueeze(1),
-                    )
-
-                    cd_sparse_embeddings = cd_sparse_embeddings.to(image_embeddings.dtype)
-
-                    IW_sparse_embeddings = F.sigmoid(sparse_embeddings/cd_sparse_embeddings) #work
-                    sparse_embeddings = IW_sparse_embeddings * sparse_embeddings
-
-                    IW_image_embeddings = F.sigmoid(image_embeddings[i])/F.sigmoid(cd_image_embeddings[i])
-                    image_embeddings[i] = IW_image_embeddings * image_embeddings[i]
-
-                    cd_low_res_masks, cd_iou_predictions = self.model.visual_model.mask_decoder(
-                        image_embeddings=cd_image_embeddings[i].unsqueeze(0),
-                        image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
-                        sparse_prompt_embeddings=cd_sparse_embeddings,
-                        dense_prompt_embeddings=cd_dense_embeddings,
-                        multimask_output=multimask_output,
-                    )
-
+                sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
                 low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
                     image_embeddings=image_embeddings[i].unsqueeze(0),
                     image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
@@ -499,16 +538,12 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                     dense_prompt_embeddings=dense_embeddings,
                     multimask_output=multimask_output,
                 )
-
                 pred_mask = self.model.visual_model.postprocess_masks(
                     low_res_masks,
                     input_size=resize_list[i],
                     original_size=original_size_list[i],
                 )
-                if importance == True:
-                    IW_masks = F.sigmoid(low_res_masks)/F.sigmoid(cd_low_res_masks)
-                    low_res_masks *= IW_masks
-                
                 pred_masks.append(pred_mask[:, 0])
                 #pdb.set_trace()
         return output_ids, pred_masks, low_res_masks
+

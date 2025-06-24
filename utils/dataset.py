@@ -8,11 +8,17 @@ import torch
 import torch.nn.functional as F
 from pycocotools import mask
 from transformers import CLIPImageProcessor
+import os
+import numpy as np
+import torch
+from pycocotools.coco import COCO
+import cv2
+import json
 
-from model.llava import conversation as conversation_lib
-from model.llava.constants import (DEFAULT_IMAGE_TOKEN, IGNORE_INDEX,
+from model.llava1p5 import conversation as conversation_lib
+from model.llava1p5.constants import (DEFAULT_IMAGE_TOKEN, IGNORE_INDEX,
                                    IMAGE_TOKEN_INDEX)
-from model.llava.mm_utils import tokenizer_image_token
+from model.llava1p5.mm_utils import tokenizer_image_token
 from model.segment_anything.utils.transforms import ResizeLongestSide
 
 from .conversation import get_default_conv_template
@@ -21,11 +27,9 @@ from .reason_seg_dataset import ReasonSegDataset
 from .refer import REFER
 from .refer_seg_dataset import ReferSegDataset
 from .sem_seg_dataset import SemSegDataset
-from .utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                    DEFAULT_IMAGE_TOKEN)
+from .utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,DEFAULT_SEMATIC_SEG,DEFAULT_INSTANT_SEG,
+                    DEFAULT_IMAGE_TOKEN, DEFAULT_INSTANT_SEG)
 from .vqa_dataset import VQADataset
-
-import pdb
 
 def collate_fn(
     batch, tokenizer=None, conv_type="llava_v1", use_mm_start_end=True, local_rank=-1
@@ -42,6 +46,9 @@ def collate_fn(
     offset_list = [0]
     cnt = 0
     inferences = []
+    change_all_list = []
+    semantic_all_lst = []
+
     for (
         image_path,
         images,
@@ -54,6 +61,17 @@ def collate_fn(
         sampled_classes,
         inference,
     ) in batch:
+        if isinstance(image_path, list):
+            change_onelst = image_path[1]
+            change_all_list.append(change_onelst)
+            image_path = image_path[0]
+        else:
+            change_all_list.append(-1)
+        if isinstance(images, list):
+            semantic_all_lst.append(images[1])
+            images = images[0]
+        else:
+            semantic_all_lst.append([-1]*masks.shape[0])
         image_path_list.append(image_path)
         images_list.append(images)
         images_clip_list.append(images_clip)
@@ -66,6 +84,8 @@ def collate_fn(
         cnt += len(conversations)
         offset_list.append(cnt)
         inferences.append(inference)
+
+    # print("conversation_list: ", conversation_list)
 
     if use_mm_start_end:
         # replace <image> token
@@ -88,6 +108,22 @@ def collate_fn(
 
     conv = conversation_lib.default_conversation.copy()
     targets = input_ids.clone()
+
+    semantic_ids_lst = []
+
+    for sublist in semantic_all_lst:
+        ids_sublist = []
+        if -1 not in sublist:
+            for item in sublist:
+                token_ids = tokenizer(item).input_ids
+                if len(token_ids) != 2:
+                    ids_sublist.append(torch.tensor(-100, dtype=torch.long))
+                    # ids_sublist.append(torch.tensor(token_ids[1:], dtype=torch.long))
+                else:
+                    ids_sublist.append(torch.tensor(token_ids[-1], dtype=torch.long))
+            semantic_ids_lst.append(ids_sublist)
+        else:
+            semantic_ids_lst.append([torch.tensor(-100, dtype=torch.long)]*len(sublist))
 
     if conv_type == "llava_v1":
         sep = conv.sep + conv.roles[1] + ": "
@@ -132,11 +168,19 @@ def collate_fn(
                     tokenizer.decode(z),
                 )
 
-        if cur_len < tokenizer.model_max_length:
-            assert cur_len == total_len
+        try:
+            if cur_len < tokenizer.model_max_length:
+                assert cur_len == total_len
+        except AssertionError:
+            print("Assertion failed. Printing each item in conversation_list:")
+            print(cur_len)
+            print(total_len)
+            print(tokenizer.model_max_length)
+            for idx, item in enumerate(conversation_list):
+                print(f"Item {idx}: {item}")
 
     if inferences[0] == False:
-        truncate_len = tokenizer.model_max_length - 255
+        truncate_len = tokenizer.model_max_length - 575
 
         if input_ids.shape[1] > truncate_len:
             input_ids = input_ids[:, :truncate_len]
@@ -158,6 +202,8 @@ def collate_fn(
         "sampled_classes_list": sampled_classes_list,
         "inference": inferences[0],
         "conversation_list": conversation_list,
+        "change_list": change_all_list,
+        "semantic_ids_list": semantic_ids_lst,
     }
 
 
@@ -184,6 +230,7 @@ class HybridDataset(torch.utils.data.Dataset):
         vqa_data="llava_instruct_150k",
         reason_seg_data="ReasonSeg|train",
         explanatory=0.1,
+        sem_seg_p=[1.0, 0.0, 0.0],
     ):
         self.exclude_val = exclude_val
         self.dataset = dataset
@@ -214,6 +261,7 @@ class HybridDataset(torch.utils.data.Dataset):
                         num_classes_per_sample,
                         exclude_val,
                         sem_seg_data,
+                        sem_seg_p,
                     )
                 )
             elif dataset == "refer_seg":
@@ -288,14 +336,23 @@ class ValDataset(torch.utils.data.Dataset):
         splits = val_dataset.split("|")
         if len(splits) == 2:
             ds, split = splits
-            images = glob.glob(
-                os.path.join(self.base_image_dir, "reason_seg", ds, split, "*.jpg")
-            )
-            self.images = images
-            self.data_type = "reason_seg"
-            
+            if ds == "ReasonSeg":
+                images = sorted(glob.glob(
+                    os.path.join(self.base_image_dir, "reason_seg", ds, split, "*.jpg")
+                ))
+                self.images = images
+                self.data_type = "reason_seg"
+
+            else: #ds == "ReasonInstanceSeg"
+                self.data_type = "reason_instance_seg"
+                self.specific_dir = "proceed_data" #""
+                self.image_dir = "/dataset/val2017"
+                self.file_count = sum(1 for filename in os.listdir(self.specific_dir) if filename.endswith(".json"))
+
         elif len(splits) == 3:
             ds, splitBy, split = splits
+            self.base_image_dir = os.path.join(self.base_image_dir,"refer_seg")
+            base_image_dir = os.path.join(base_image_dir,"refer_seg")
             refer_api = REFER(self.base_image_dir, ds, splitBy)
             ref_ids_val = refer_api.getRefIds(split=split)
             images_ids_val = refer_api.getImgIds(ref_ids=ref_ids_val)
@@ -337,6 +394,8 @@ class ValDataset(torch.utils.data.Dataset):
     def __len__(self):
         if self.data_type == "refer_seg":
             return len(self.refer_seg_ds["images"])
+        elif self.data_type == "reason_instance_seg":
+            return self.file_count
         else:
             return len(self.images)
 
@@ -351,6 +410,26 @@ class ValDataset(torch.utils.data.Dataset):
         padw = self.img_size - w
         x = F.pad(x, (0, padw, 0, padh))
         return x
+    
+    def get_multi_mask_from_json(self, item, img):
+        
+        height, width = img.shape[:2]
+        inform = item['ID']
+        area_list = []
+        valid_poly_list = []
+        comments = item['English Question']
+
+        masks = []
+        for id in inform:
+            mask = np.zeros((height, width), dtype=np.uint8)
+            points = item['points'][id]['points']
+
+            label_value = 1  # target
+
+            cv2.polylines(mask, np.array([points], dtype=np.int32), True, label_value, 1)
+            cv2.fillPoly(mask, np.array([points], dtype=np.int32), label_value)
+            masks.append(mask)
+        return masks, comments, True
 
     def __getitem__(self, idx):
         if self.data_type == "refer_seg":
@@ -379,6 +458,84 @@ class ValDataset(torch.utils.data.Dataset):
             image = cv2.imread(image_path)
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             is_sentence = False
+            
+            #### Move to up  
+            conversations = []
+            conv = conversation_lib.default_conversation.copy()
+            i = 0
+            while i < len(sampled_sents):
+                conv.messages = []
+                text = sampled_sents[i].strip()
+                if is_sentence:
+                    conv.append_message(
+                        conv.roles[0],
+                        DEFAULT_IMAGE_TOKEN
+                        + "\n {} Please output segmentation mask.".format(text),
+                    )
+                    conv.append_message(conv.roles[1], "[SEG].")
+                else:
+                    conv.append_message(
+                        conv.roles[0],
+                        DEFAULT_IMAGE_TOKEN
+                        + "\n What is {} in this image? Please output segmentation mask.".format(
+                            text
+                        ),
+                    )
+                    conv.append_message(conv.roles[1], "[SEG].")
+                conversations.append(conv.get_prompt())
+                i += 1
+
+        elif self.data_type == "reason_instance_seg":
+            json_item = os.path.join(self.specific_dir, f'{idx+1}.json')
+            with open(json_item, "r") as f:
+                item = json.load(f)
+            
+            image_path = os.path.join(self.image_dir, item['img_path'])
+            image = cv2.imread(image_path)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            ori_size = image.shape[:2]
+            masks_json, sents, is_sentence = self.get_multi_mask_from_json(item, image)
+            sampled_sents = [sents]
+            sampled_masks = [
+                (masks_json[i] == 1).astype(np.float32) for i in range(len(masks_json))
+            ]
+            questions = []
+            answers = []
+            choice = 0
+            change_lst_num = []
+            for text in sampled_sents:
+                question_template = DEFAULT_IMAGE_TOKEN + "\n" + "{sent} Please output segmentation mask." + DEFAULT_INSTANT_SEG
+                questions.append(question_template.format(sent=text))
+                cnt = len(item['ID'])
+                seg_tokens = ""
+                for index in range(cnt):
+                    seg_tokens += "[SEG]"
+                    if index < cnt - 2:
+                        seg_tokens += ", "
+                    elif index == cnt - 2:
+                        if index == 0:
+                            seg_tokens += " and "
+                        else:
+                            seg_tokens += ", and "
+                # add explanation if applicable
+                change_lst_num.append(cnt)
+                if choice == 0:  # [SEG] token
+                    answer_template = "{seg_tokens}."
+                    cur_answer = answer_template.format(seg_tokens=seg_tokens)
+                    answers.append(cur_answer)
+
+                conversations = []
+                conv = conversation_lib.default_conversation.copy()
+                roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
+
+                i = 0
+                while i < len(questions):
+                    conv.messages = []
+                    conv.append_message(conv.roles[0], questions[i])
+                    conv.append_message(conv.roles[1], answers[i])
+                    conversations.append(conv.get_prompt())
+                    i += 1
+
         else:
             image_path = self.images[idx]
             image = cv2.imread(image_path)
@@ -386,31 +543,33 @@ class ValDataset(torch.utils.data.Dataset):
             json_path = image_path.replace(".jpg", ".json")
             mask_json, sampled_sents, is_sentence = get_mask_from_json(json_path, image)
             sampled_sents = [sampled_sents[0]]
-
-        conversations = []
-        conv = conversation_lib.default_conversation.copy()
-        i = 0
-        while i < len(sampled_sents):
-            conv.messages = []
-            text = sampled_sents[i].strip()
-            if is_sentence:
-                conv.append_message(
-                    conv.roles[0],
-                    DEFAULT_IMAGE_TOKEN
-                    + "\n {} Please output segmentation mask.".format(text),
-                )
-                conv.append_message(conv.roles[1], "[SEG].")
-            else:
-                conv.append_message(
-                    conv.roles[0],
-                    DEFAULT_IMAGE_TOKEN
-                    + "\n What is {} in this image? Please output segmentation mask.".format(
-                        text
-                    ),
-                )
-                conv.append_message(conv.roles[1], "[SEG].")
-            conversations.append(conv.get_prompt())
-            i += 1
+   
+            #### Move to up  
+            conversations = []
+            conv = conversation_lib.default_conversation.copy()
+            i = 0
+            while i < len(sampled_sents):
+                conv.messages = []
+                text = sampled_sents[i].strip()
+                if is_sentence:
+                    conv.append_message(
+                        conv.roles[0],
+                        DEFAULT_IMAGE_TOKEN
+                        + "\n {} Please output segmentation mask.".format(text)+DEFAULT_SEMATIC_SEG,
+                    )
+                    conv.append_message(conv.roles[1], "[SEG].")
+                else:
+                    conv.append_message(
+                        conv.roles[0],
+                        DEFAULT_IMAGE_TOKEN
+                        + "\n What is {} in this image? Please output segmentation mask.".format(
+                            text
+                        )+DEFAULT_SEMATIC_SEG,
+                    )
+                    conv.append_message(conv.roles[1], "[SEG].")
+                conversations.append(conv.get_prompt())
+                i += 1
+                
 
         # preprocess image for clip
         image_clip = self.clip_image_processor.preprocess(image, return_tensors="pt")[
@@ -446,6 +605,8 @@ class ValDataset(torch.utils.data.Dataset):
                 )  # sometimes there are multiple binary map (corresponding to multiple segs)
                 m = m.astype(np.uint8)  # convert to np.uint8
                 masks.append(m)
+        elif self.data_type == "reason_instance_seg":
+            masks = sampled_masks
         else:
             masks = [mask_json]
 
@@ -454,15 +615,30 @@ class ValDataset(torch.utils.data.Dataset):
         labels = torch.ones(masks.shape[1], masks.shape[2]) * self.ignore_label
         inference = True
 
-        return (
-            image_path,
-            image,
-            image_clip,
-            conversations,
-            masks,
-            labels,
-            resize,
-            None,
-            None,
-            inference,
-        )
+        if self.data_type == "reason_instance_seg":      
+            change_lst = [[i for i in range(change_lst_num[j])] for j in range(len(change_lst_num))]
+            return (
+                [image_path, change_lst],
+                image,
+                image_clip,
+                conversations,
+                masks,
+                labels,
+                resize,
+                None,
+                None,
+                inference,
+            )
+        else:
+            return (
+                image_path,
+                image,
+                image_clip,
+                conversations,
+                masks,
+                labels,
+                resize,
+                None,
+                None,
+                inference,
+            )

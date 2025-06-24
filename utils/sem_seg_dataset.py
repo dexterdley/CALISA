@@ -11,15 +11,15 @@ from PIL import Image
 from pycocotools.coco import COCO
 from transformers import CLIPImageProcessor
 
-from model.llava import conversation as conversation_lib
+from model.llava1p5 import conversation as conversation_lib
 from model.segment_anything.utils.transforms import ResizeLongestSide
 
-from .utils import ANSWER_LIST, SHORT_QUESTION_LIST
+from .utils import ANSWER_LIST, SHORT_QUESTION_LIST, MULTI_CLASS_QUESTION_LIST, INST_ANSWER_LIST
 
 
 def init_mapillary(base_image_dir):
     mapillary_data_root = os.path.join(base_image_dir, "mapillary")
-    with open(os.path.join(mapillary_data_root, "config_v2.0.json")) as f:
+    with open(os.path.join(mapillary_data_root, "config_v2.0.json"), "r") as f:
         mapillary_classes = json.load(f)["labels"]
     mapillary_classes = [x["readable"].lower() for x in mapillary_classes]
     mapillary_classes = np.array(mapillary_classes)
@@ -141,10 +141,14 @@ class SemSegDataset(torch.utils.data.Dataset):
         num_classes_per_sample: int = 3,
         exclude_val=False,
         sem_seg_data="ade20k||cocostuff||partimagenet||pascal_part||paco_lvis||mapillary",
+        sem_seg_p=[1.0, 0.0, 0.0],
     ):
         self.exclude_val = exclude_val
         self.samples_per_epoch = samples_per_epoch
         self.num_classes_per_sample = num_classes_per_sample
+        self.sem_seg_p = sem_seg_p
+
+        print("sem_seg_p: ", sem_seg_p)
 
         self.base_image_dir = base_image_dir
         self.image_size = image_size
@@ -155,6 +159,9 @@ class SemSegDataset(torch.utils.data.Dataset):
 
         self.short_question_list = SHORT_QUESTION_LIST
         self.answer_list = ANSWER_LIST
+
+        self.multi_class_question_list = MULTI_CLASS_QUESTION_LIST
+        self.inst_answer_list = INST_ANSWER_LIST
 
         self.data2list = {}
         self.data2classes = {}
@@ -275,20 +282,59 @@ class SemSegDataset(torch.utils.data.Dataset):
         questions = []
         answers = []
         class_ids = []
-        for sampled_cls in sampled_classes:
-            text = sampled_cls
 
-            assert len(text.split("||")) == 1
-            question_template = random.choice(self.short_question_list)
-            questions.append(question_template.format(class_name=text.lower()))
+        i = 0
+        while i < len(sampled_classes):
+            number = np.random.choice([1,2,3], p=self.sem_seg_p)
+            number = min(len(sampled_classes) - i, number)
+            
+            if number == 1:
+                sampled_cls = sampled_classes[i]
+                text = sampled_cls
+                question_template = random.choice(self.short_question_list)
+                questions.append(question_template.format(class_name=text.lower()))
+                answers.append(random.choice(self.answer_list))
+                if ds in ["paco_lvis", "pascal_part"]:
+                    i += number
+                    continue
+                class_id = self.data2classes[ds].tolist().index(sampled_cls)
+                class_ids.append(class_id)
+            else:
+                text = "the "
+                for idx, c in enumerate(sampled_classes[i:i+number]):
+                    text += c
+                    if idx < number - 2:
+                        text += ", "
+                    elif idx == number - 2:
+                        if idx == 0:
+                            text += " and "
+                        else:
+                            text += ", and "
+                question_template = random.choice(self.multi_class_question_list)
+                questions.append(question_template.format(classes=text.lower()))
 
-            answers.append(random.choice(self.answer_list))
+                seg_tokens = ""
+                for idx in range(number):
+                    seg_tokens += "[SEG]"
+                    if idx < number - 2:
+                        seg_tokens += ", "
+                    elif idx == number - 2:
+                        if idx == 0:
+                            seg_tokens += " and "
+                        else:
+                            seg_tokens += ", and "
+                answer_template = random.choice(self.inst_answer_list)
+                answers.append(answer_template.format(seg_tokens=seg_tokens))
 
-            if ds in ["paco_lvis", "pascal_part"]:
-                continue
+                if ds in ["paco_lvis", "pascal_part"]:
+                    i += number
+                    continue
+                for sampled_cls in sampled_classes[i:i+number]:
+                    class_id = self.data2classes[ds].tolist().index(sampled_cls)
+                    class_ids.append(class_id)
+            i += number
 
-            class_id = self.data2classes[ds].tolist().index(sampled_cls)
-            class_ids.append(class_id)
+
 
         conversations = []
         conv = conversation_lib.default_conversation.copy()
