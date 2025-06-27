@@ -487,16 +487,17 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                     dim=1,
                 )
                 hidden_states = []
-                assert len(self.model.text_hidden_fcs) == 1
                 hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states))
+
                 last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
                 pred_embeddings = last_hidden_state[seg_token_mask]
 
-                seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
-                seg_token_offset = seg_token_counts.cumsum(-1)
-                seg_token_offset = torch.cat(
-                    [torch.zeros(1).long().cuda(), seg_token_offset], dim=0
-                )
+                if seg_token_offset is None:
+                    seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
+                    seg_token_offset = seg_token_counts.cumsum(-1)
+                    seg_token_offset = torch.cat(
+                        [torch.zeros(1).long().cuda(), seg_token_offset], dim=0
+                    )
                 pred_embeddings_ = []
                 for i in range(len(seg_token_offset) - 1):
                     start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
@@ -512,10 +513,23 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                 output_hidden_states=True,
                 return_dict_in_generate=True,
             )
+
+            cd_outputs = self.generate(
+                images=gaussian_noise(images_clip, bound=noise).bfloat16(),
+                input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                num_beams=1,
+                output_hidden_states=True,
+                return_dict_in_generate=True,
+            )
             
             output_ids, pred_embeddings, seg_token_offset = process_generation_output(outputs)
+            cd_output_ids, cd_pred_embeddings, _ = process_generation_output(cd_outputs, seg_token_offset)
 
+            ### Visual encoder
             image_embeddings = self.get_visual_embs(images)
+            corrupt_images = gaussian_noise(images, bound=noise).bfloat16()
+            cd_image_embeddings = self.get_visual_embs(corrupt_images)
 
             multimask_output = False
             pred_masks = []
@@ -529,8 +543,35 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                     masks=None,
                     text_embeds=pred_embeddings[i].unsqueeze(1),
                 )
-
                 sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
+                
+                if importance == True:
+                    (
+                        cd_sparse_embeddings,
+                        cd_dense_embeddings,
+                    ) = self.model.visual_model.prompt_encoder(
+                        points=None,
+                        boxes=None,
+                        masks=None,
+                        text_embeds=cd_pred_embeddings[i].unsqueeze(1),
+                    )
+
+                    cd_sparse_embeddings = cd_sparse_embeddings.to(image_embeddings.dtype)
+
+                    IW_sparse_embeddings = F.sigmoid(sparse_embeddings[i]/cd_sparse_embeddings[i]) #work
+                    sparse_embeddings[i] = IW_sparse_embeddings * sparse_embeddings[i]
+
+                    IW_image_embeddings = F.sigmoid(image_embeddings[i])/F.sigmoid(cd_image_embeddings[i])
+                    image_embeddings[i] = IW_image_embeddings * image_embeddings[i]
+
+                    cd_low_res_masks, cd_iou_predictions = self.model.visual_model.mask_decoder(
+                        image_embeddings=cd_image_embeddings[i].unsqueeze(0),
+                        image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
+                        sparse_prompt_embeddings=cd_sparse_embeddings,
+                        dense_prompt_embeddings=cd_dense_embeddings,
+                        multimask_output=multimask_output,
+                    )
+
                 low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
                     image_embeddings=image_embeddings[i].unsqueeze(0),
                     image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
@@ -543,6 +584,10 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                     input_size=resize_list[i],
                     original_size=original_size_list[i],
                 )
+                if importance == True:
+                    IW_masks = F.sigmoid(low_res_masks[i])/F.sigmoid(cd_low_res_masks[i])
+                    low_res_masks[i] *= IW_masks
+
                 pred_masks.append(pred_mask[:, 0])
                 #pdb.set_trace()
         return output_ids, pred_masks, low_res_masks
